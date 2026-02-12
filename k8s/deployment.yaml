@@ -1,0 +1,420 @@
+# ============================================================================
+# Kimi K2.5 Agent Swarm - Kubernetes Deployment
+# Production-ready with autoscaling, health checks, and resource limits
+# ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kimi-swarm
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-config
+  namespace: kimi-swarm
+data:
+  OLLAMA_HOST: "http://ollama-service:11434"
+  OLLAMA_MODEL: "kimi-k2.5:cloud"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  POSTGRES_HOST: "postgres-service"
+  POSTGRES_DB: "kimi_swarm"
+
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: kimi-swarm
+spec:
+  serviceName: postgres-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: postgres
+        image: ankane/pgvector:v0.7.4
+        ports:
+        - containerPort: 5432
+          name: postgres
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false  # Postgres needs writable data dir
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: POSTGRES_DB
+          value: kimi_swarm
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: kimi-secrets
+              key: postgres-user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kimi-secrets
+              key: postgres-password
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        - name: init-scripts
+          mountPath: /docker-entrypoint-initdb.d
+          readOnly: true
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - postgres
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: init-scripts
+        configMap:
+          name: postgres-init
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-storage
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: kimi-swarm
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None
+
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: kimi-swarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server", "--appendonly", "yes", "--requirepass", "$(REDIS_PASSWORD)"]
+        ports:
+        - containerPort: 6379
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kimi-secrets
+              key: redis-password
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - -a
+            - $(REDIS_PASSWORD)
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        emptyDir: {}
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: kimi-swarm
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# Ollama Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: kimi-swarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: ollama
+        image: ollama/ollama:0.5.7
+        ports:
+        - containerPort: 11434
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+        volumeMounts:
+        - name: ollama-storage
+          mountPath: /root/.ollama
+      volumes:
+      - name: ollama-storage
+        persistentVolumeClaim:
+          claimName: ollama-pvc
+
+---
+# Ollama Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+  namespace: kimi-swarm
+spec:
+  selector:
+    app: ollama
+  ports:
+  - port: 11434
+    targetPort: 11434
+
+---
+# Kimi API Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-api
+  namespace: kimi-swarm
+spec:
+  replicas: 5  # Start with 5, autoscale to 20
+  selector:
+    matchLabels:
+      app: kimi-api
+  template:
+    metadata:
+      labels:
+        app: kimi-api
+    spec:
+      containers:
+      - name: api
+        image: kimi-swarm:1.0.0
+        ports:
+        - containerPort: 8000
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: KIMI_API_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kimi-secrets
+              key: api-secret-key
+        - name: KIMI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kimi-secrets
+              key: api-key
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kimi-secrets
+              key: redis-password
+        envFrom:
+        - configMapRef:
+            name: kimi-config
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+---
+# Kimi API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-api-service
+  namespace: kimi-swarm
+spec:
+  selector:
+    app: kimi-api
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: LoadBalancer
+
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kimi-api-hpa
+  namespace: kimi-swarm
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kimi-api
+  minReplicas: 5
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# PersistentVolumeClaim for Ollama
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-pvc
+  namespace: kimi-swarm
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# NetworkPolicy: Restrict traffic between pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kimi-network-policy
+  namespace: kimi-swarm
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Only allow traffic from within the namespace
+  - from:
+    - podSelector: {}
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow traffic within namespace
+  - to:
+    - podSelector: {}
+  # Allow HTTPS outbound (for API calls)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443

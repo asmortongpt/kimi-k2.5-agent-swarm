@@ -1,0 +1,199 @@
+name: Safe Deployment with Git Verification
+
+on:
+  push:
+    branches:
+      - main
+      - feature/*
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  test-and-build:
+    name: Test and Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for proper git operations
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Run linter
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build application
+        run: npm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'staging' }}
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Load git operations library
+        run: |
+          chmod +x scripts/lib/git-operations.sh
+          source scripts/lib/git-operations.sh
+
+      - name: Verify deployment with safe git operations
+        run: |
+          # Source the library
+          source scripts/lib/git-operations.sh
+
+          # Ensure working directory is clean
+          if ! ensure_clean_working_directory; then
+            log_warning "Working directory has changes, adding build artifacts"
+            git add dist/
+            git commit -m "build: Add build artifacts for deployment [skip ci]" || true
+          fi
+
+          # Get current branch
+          BRANCH=$(get_current_branch)
+          log_info "Current branch: $BRANCH"
+
+          # Verify we can access remote
+          if remote_branch_exists "$BRANCH"; then
+            log_success "Remote branch exists: $BRANCH"
+          else
+            log_error "Remote branch does not exist: $BRANCH"
+            exit 1
+          fi
+
+      - name: Safe deployment push
+        if: success()
+        run: |
+          source scripts/lib/git-operations.sh
+
+          BRANCH=$(get_current_branch)
+
+          # Use safe push with automatic pull/rebase
+          if safe_git_push_with_pull "$BRANCH"; then
+            log_success "Deployment push completed successfully"
+          else
+            log_error "Deployment push failed"
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify deployment
+        if: success()
+        run: |
+          source scripts/lib/git-operations.sh
+
+          BRANCH=$(get_current_branch)
+
+          # Verify remote commit matches local
+          if verify_remote_commit "$BRANCH"; then
+            log_success "Deployment verified - commits match"
+          else
+            log_error "Deployment verification failed - commits do not match"
+            exit 1
+          fi
+
+      - name: Create deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment || 'staging' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** $(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** $(git rev-parse HEAD)" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Deployment completed successfully with verified git operations" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Deployment failed - check logs for details" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  verify-git-operations:
+    name: Verify Git Operations (Test Suite)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Test git operations library
+        run: |
+          chmod +x scripts/lib/git-operations.sh
+          source scripts/lib/git-operations.sh
+
+          log_info "Testing git operations library..."
+
+          # Test: Get current branch
+          BRANCH=$(get_current_branch)
+          log_success "Current branch: $BRANCH"
+
+          # Test: Check if remote branch exists
+          if remote_branch_exists "$BRANCH"; then
+            log_success "Remote branch exists: $BRANCH"
+          else
+            log_error "Remote branch does not exist: $BRANCH"
+            exit 1
+          fi
+
+          # Test: Ensure clean working directory
+          if ensure_clean_working_directory; then
+            log_success "Working directory is clean"
+          else
+            log_warning "Working directory has uncommitted changes"
+          fi
+
+          log_success "All git operations tests passed"

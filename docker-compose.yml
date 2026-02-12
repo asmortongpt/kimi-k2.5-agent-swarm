@@ -1,0 +1,181 @@
+# ============================================================================
+# Kimi K2.5 Agent Swarm - Production Docker Compose
+# Complete stack with all real services (NO MOCKS)
+# ============================================================================
+
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: ankane/pgvector:v0.7.4
+    container_name: kimi-postgres
+    environment:
+      POSTGRES_DB: kimi_swarm
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kimi-network
+
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: kimi-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kimi-network
+
+  # Qdrant vector database
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: kimi-qdrant
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - kimi-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Ollama for local Kimi K2.5 inference
+  ollama:
+    image: ollama/ollama:0.5.7
+    container_name: kimi-ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - kimi-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Kimi K2.5 API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kimi-api
+    environment:
+      # Database
+      AZURE_SQL_SERVER: postgres
+      AZURE_SQL_DATABASE: kimi_swarm
+      AZURE_SQL_USERNAME: ${POSTGRES_USER:?Set POSTGRES_USER}
+      AZURE_SQL_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+
+      # Ollama
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: kimi-k2.5:cloud
+
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+
+      # Qdrant
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+
+      # Auth
+      KIMI_API_SECRET_KEY: ${KIMI_API_SECRET_KEY:?Set KIMI_API_SECRET_KEY}
+      KIMI_API_KEY: ${KIMI_API_KEY:-}
+      KIMI_CORS_ORIGINS: ${KIMI_CORS_ORIGINS:-http://localhost:8000,http://localhost:3000}
+
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    volumes:
+      - ./server:/app/server:ro
+      - ./database:/app/database:ro
+    networks:
+      - kimi-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Prometheus for metrics (production monitoring)
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: kimi-prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - kimi-network
+
+  # Grafana for dashboards (production monitoring)
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: kimi-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?Set GRAFANA_PASSWORD in .env}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - kimi-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  ollama_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  kimi-network:
+    driver: bridge
