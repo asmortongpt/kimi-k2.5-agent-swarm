@@ -3,19 +3,17 @@
 # Complete stack with all real services (NO MOCKS)
 # ============================================================================
 
-version: '3.8'
-
 services:
   # PostgreSQL with pgvector extension
   postgres:
-    image: ankane/pgvector:v0.7.4
+    image: pgvector/pgvector:pg17
     container_name: kimi-postgres
     environment:
       POSTGRES_DB: kimi_swarm
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql
@@ -33,7 +31,7 @@ services:
     container_name: kimi-redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -67,7 +65,7 @@ services:
     image: ollama/ollama:0.5.7
     container_name: kimi-ollama
     ports:
-      - "127.0.0.1:11434:11434"
+      - "127.0.0.1:11435:11434"
     volumes:
       - ollama_data:/root/.ollama
     networks:

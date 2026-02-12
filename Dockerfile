@@ -44,7 +44,7 @@ COPY --chown=kimi:kimi config/ ./config/
 # Set environment
 ENV PATH=/home/kimi/.local/bin:$PATH
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app:/app/server
 
 # Security: Run as non-root
 USER kimi

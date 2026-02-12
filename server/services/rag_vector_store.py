@@ -16,7 +16,7 @@ import json
 from dotenv import load_dotenv
 
 # Import real embedding service
-from embeddings import RealEmbeddingService, EmbeddingProvider
+from services.embeddings import RealEmbeddingService, EmbeddingProvider
 
 load_dotenv(os.path.expanduser('~/.env'))
 
